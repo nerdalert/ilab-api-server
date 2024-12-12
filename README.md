@@ -21,20 +21,34 @@ go mod download
 ### Run the Server
 
 #### For macOS with Metal (MPS):
+
 ```bash
-go run main.go -base-dir /path/to/base-dir -taxonomy-path /path/to/taxonomy -osx
+go run main.go --base-dir /path/to/base-dir --taxonomy-path /path/to/taxonomy --osx
 ```
 
 #### For CUDA-enabled environments:
+
 ```bash
-go run main.go -base-dir /path/to/base-dir -taxonomy-path /path/to/taxonomy -cuda
+go run main.go --base-dir /path/to/base-dir --taxonomy-path /path/to/taxonomy --cuda
 ```
 
-Replace `/path/to/base-dir` and `/path/to/taxonomy` with your actual directories.
+#### For a RHEL AI machine:
 
-### Example:
+- If you're operating on a Red Hat Enterprise Linux AI (RHEL AI) machine, and the ilab binary is already available in your $PATH, you don't need to specify the --base-dir. Additionally, pass CUDA support with `--cuda`.
+
 ```bash
-go run main.go -base-dir /Users/user/code/instructlab -taxonomy-path /Users/user/code/taxonomy -osx
+go run main.go --taxonomy-path ~/.local/share/instructlab/taxonomy/ --rhelai --cuda
+```
+
+The `--rhelai` flag indicates that the ilab binary is available in the system's $PATH and does not require a virtual environment.
+When using `--rhelai`, the `--base-dir` flag is not required since it will be in a known location at least for meow.
+
+### Example command with paths:
+
+Here's an example command for running the server on a macOS machine with Metal support:
+
+```bash
+go run main.go --base-dir /Users/user/code/instructlab --taxonomy-path ~/.local/share/instructlab/taxonomy/ --osx
 ```
 
 ## API Doc
@@ -138,6 +152,14 @@ Starts a training job.
     "branchName": "name-of-the-branch"
   }
   ```
+  
+  **Note**: The `modelName` can be provided **with or without** the `models/` prefix. Examples:
+  
+  - Without prefix: `"granite-7b-lab-Q4_K_M.gguf"`
+  - With prefix: `"models/granite-7b-starter"`
+  
+  The server will handle the prefix to construct the correct model path.
+
 - **Response**:
   ```json
   {
@@ -158,6 +180,9 @@ Combines data generation and training into a single pipeline job.
     "branchName": "name-of-the-branch"
   }
   ```
+  
+  **Note**: Similar to the training endpoint, `modelName` can be with or without the `models/` prefix.
+
 - **Response**:
   ```json
   {
@@ -190,4 +215,15 @@ Serves the base model on port `8000`.
     "job_id": "serve-job-id"
   }
   ```
-```
+
+## Handling Model Names with or without `models/` Prefix
+
+The server is designed to handle `modelName` inputs **both with and without** the `models/` prefix to prevent path duplication. Here’s how it works:
+
+- **Without Prefix**:
+  - **Input**: `"granite-7b-lab-Q4_K_M.gguf"`
+  - **Constructed Path**: `~/.cache/instructlab/models/granite-7b-lab-Q4_K_M.gguf`
+
+- **With Prefix**:
+  - **Input**: `"models/granite-7b-starter"`
+  - **Constructed Path**: `~/.cache/instructlab/models/granite-7b-starter`
