@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -50,6 +51,11 @@ type ModelCache struct {
 	Mutex  sync.Mutex
 }
 
+type QnaEvalRequest struct {
+	ModelPath string `json:"model_path"`
+	YamlFile  string `json:"yaml_file"`
+}
+
 var (
 	baseDir            string
 	taxonomyPath       string
@@ -57,6 +63,8 @@ var (
 	ilabCmd            string
 	isOSX              bool
 	isCuda             bool
+	useVllm            bool
+	pipelineType       string
 	jobs               = make(map[string]*Job)
 	jobsLock           = sync.Mutex{}
 	modelLock          = sync.Mutex{}
@@ -83,6 +91,10 @@ func main() {
 	rootCmd.Flags().StringVar(&taxonomyPath, "taxonomy-path", "", "Path to the taxonomy repository for Git operations (required)")
 	rootCmd.Flags().BoolVar(&isOSX, "osx", false, "Enable OSX-specific settings (default: false)")
 	rootCmd.Flags().BoolVar(&isCuda, "cuda", false, "Enable Cuda (default: false)")
+	rootCmd.Flags().BoolVar(&useVllm, "vllm", false, "Enable VLLM model serving using podman containers")
+
+	// New pipeline flag:
+	rootCmd.Flags().StringVar(&pipelineType, "pipeline", "simple", "Pipeline type (simple or full)")
 
 	// Mark flags as required based on --rhelai
 	rootCmd.PreRunE = func(cmd *cobra.Command, args []string) error {
@@ -92,6 +104,15 @@ func main() {
 		if taxonomyPath == "" {
 			return fmt.Errorf("--taxonomy-path is required")
 		}
+
+		// Validate pipelineType
+		switch pipelineType {
+		case "simple", "full":
+			// ok
+		default:
+			return fmt.Errorf("--pipeline must be 'simple' or 'full'; got '%s'", pipelineType)
+		}
+
 		return nil
 	}
 
@@ -130,7 +151,8 @@ func runServer(cmd *cobra.Command, args []string) {
 		log.Fatalf("Taxonomy path does not exist: %s", taxonomyPath)
 	}
 
-	log.Printf("Running with baseDir=%s, taxonomyPath=%s, isOSX=%v, isCuda=%v", baseDir, taxonomyPath, isOSX, isCuda)
+	log.Printf("Running with baseDir=%s, taxonomyPath=%s, isOSX=%v, isCuda=%v, useVllm=%v, pipeline=%s",
+		baseDir, taxonomyPath, isOSX, isCuda, useVllm, pipelineType)
 	log.Printf("Current working directory: %s", mustGetCwd())
 
 	// Load existing jobs from file
@@ -160,6 +182,7 @@ func runServer(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/pipeline/generate-train", generateTrainPipeline).Methods("POST")
 	r.HandleFunc("/model/serve-latest", serveLatestCheckpoint).Methods("POST")
 	r.HandleFunc("/model/serve-base", serveBaseModel).Methods("POST")
+	r.HandleFunc("/qna-eval", runQnaEval).Methods("POST")
 
 	// Start the server with logging
 	log.Printf("Server starting on port 8080... (Taxonomy path: %s)", taxonomyPath)
@@ -271,20 +294,6 @@ func getBaseCacheDir() (string, error) {
 		return "", fmt.Errorf("failed to get user home directory: %v", err)
 	}
 	return filepath.Join(homeDir, ".cache", "instructlab"), nil
-}
-
-// Helper function to construct the full model path: ~/.cache/instructlab/models/<modelName>
-func getFullModelPath(modelName string) (string, error) {
-	baseCacheDir, err := getBaseCacheDir()
-	if err != nil {
-		return "", err
-	}
-	// If modelName starts with "models/", do not prepend "models/" again.
-	// Otherwise, prepend "models/".
-	if strings.HasPrefix(modelName, "models/") {
-		return filepath.Join(baseCacheDir, modelName), nil
-	}
-	return filepath.Join(baseCacheDir, "models", modelName), nil
 }
 
 // Helper function to get the latest dataset file
@@ -505,12 +514,12 @@ func generateData(w http.ResponseWriter, r *http.Request) {
 // startGenerateJob starts the data generation job and returns the job ID.
 func startGenerateJob() (string, error) {
 	ilabPath := getIlabCommand()
+
+	//cmdArgs := []string{"data", "generate", "--pipeline", pipelineType}
+	// TODO: bother supporting any other pipeline for generate?
+	// Should GPUs be variable or just the default?
 	cmdArgs := []string{"data", "generate"}
-	if rhelai {
-		cmdArgs = append(cmdArgs, "--pipeline", "full")
-	} else {
-		cmdArgs = append(cmdArgs, "--pipeline", "simple")
-	}
+
 	cmd := exec.Command(ilabPath, cmdArgs...)
 
 	if !rhelai {
@@ -605,7 +614,7 @@ func trainModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sanitize the modelName
+	// Sanitize the modelName (still important in some cases)
 	sanitizedModelName := sanitizeModelName(reqBody.ModelName)
 	log.Printf("Sanitized modelName: '%s'", sanitizedModelName)
 
@@ -624,7 +633,7 @@ func trainModel(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Successfully checked out branch: '%s'", reqBody.BranchName)
 
-	// Start the training job
+	// Start the training job, passing the sanitized model name and branch name
 	jobID, err := startTrainJob(sanitizedModelName, reqBody.BranchName)
 	if err != nil {
 		log.Printf("Error starting train job: %v", err)
@@ -648,33 +657,33 @@ func trainModel(w http.ResponseWriter, r *http.Request) {
 	log.Println("POST /model/train response sent successfully")
 }
 
-// startTrainJob starts the training job and returns the job ID.
 func startTrainJob(modelName, branchName string) (string, error) {
 	log.Printf("Starting training job for model: '%s', branch: '%s'", modelName, branchName)
 
-	// Generate unique job ID
+	// Generate a unique job ID
 	jobID := fmt.Sprintf("t-%d", time.Now().UnixNano())
 	logFilePath := filepath.Join("logs", fmt.Sprintf("%s.log", jobID))
 
-	// Get the full model path
+	// Get the full model path. This ensures ~/.cache/instructlab/models/... is always used.
 	fullModelPath, err := getFullModelPath(modelName)
 	if err != nil {
 		return "", fmt.Errorf("failed to get full model path: %v", err)
 	}
+	log.Printf("Resolved fullModelPath: '%s'", fullModelPath)
 
-	// Ensure the model directory exists
+	// Ensure the model directory exists (e.g. ~/.cache/instructlab/models/...)
 	modelDir := filepath.Dir(fullModelPath)
-	err = os.MkdirAll(modelDir, os.ModePerm)
-	if err != nil {
+	if err := os.MkdirAll(modelDir, os.ModePerm); err != nil {
 		return "", fmt.Errorf("failed to create model directory '%s': %v", modelDir, err)
 	}
 
-	// Training options
 	ilabPath := getIlabCommand()
+
+	// Default base training command (if pipeline != "simple" or we skip that logic):
 	cmdArgs := []string{
 		"model", "train",
-		"--pipeline=simple",
-		fmt.Sprintf("--model-path=%s", modelName),
+		"--pipeline", pipelineType,
+		fmt.Sprintf("--model-path=%s", fullModelPath), // <--- Note the absolute path here
 	}
 	if isOSX {
 		cmdArgs = append(cmdArgs, "--device=mps")
@@ -683,36 +692,89 @@ func startTrainJob(modelName, branchName string) (string, error) {
 		cmdArgs = append(cmdArgs, "--device=cuda")
 	}
 
-	// Check if RHELAI is enabled
+	// -------------------------------------------------------------------------
+	// SPECIAL LOGIC for pipelineType == "simple" (when not rhelai).
+	//   1) Copy the latest "knowledge_train_msgs_*.jsonl" => train_gen.jsonl
+	//   2) Copy the latest "test_ggml-model-*.jsonl"      => test_gen.jsonl
+	//   3) Pass only the dataset directory to --data-path
+	// -------------------------------------------------------------------------
+	if pipelineType == "simple" && !rhelai {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("failed to get user home directory: %v", err)
+		}
+		datasetDir := filepath.Join(homeDir, ".local", "share", "instructlab", "datasets")
+
+		// 1) Find the latest "knowledge_train_msgs_*.jsonl"
+		latestTrainFile, err := findLatestFileWithPrefix(datasetDir, "knowledge_train_msgs_")
+		if err != nil {
+			return "", fmt.Errorf("failed to find knowledge_train_msgs_*.jsonl file: %v", err)
+		}
+		// Copy it to train_gen.jsonl
+		trainGenPath := filepath.Join(datasetDir, "train_gen.jsonl")
+		if err := overwriteCopy(latestTrainFile, trainGenPath); err != nil {
+			return "", fmt.Errorf("failed to copy %s to %s: %v", latestTrainFile, trainGenPath, err)
+		}
+
+		// 2) Find the latest "test_ggml-model-*.jsonl"
+		latestTestFile, err := findLatestFileWithPrefix(datasetDir, "test_ggml-model")
+		if err != nil {
+			return "", fmt.Errorf("failed to find test_ggml-model*.jsonl file: %v", err)
+		}
+		// Copy it to test_gen.jsonl
+		testGenPath := filepath.Join(datasetDir, "test_gen.jsonl")
+		if err := overwriteCopy(latestTestFile, testGenPath); err != nil {
+			return "", fmt.Errorf("failed to copy %s to %s: %v", latestTestFile, testGenPath, err)
+		}
+
+		// Finally, pass only the dataset directory to --data-path
+		cmdArgs = []string{
+			"model", "train",
+			"--pipeline", pipelineType,
+			fmt.Sprintf("--data-path=%s", datasetDir),
+			fmt.Sprintf("--model-path=%s", fullModelPath), // <--- Use absolute path here too
+		}
+		if isOSX {
+			cmdArgs = append(cmdArgs, "--device=mps")
+		}
+		if isCuda {
+			cmdArgs = append(cmdArgs, "--device=cuda")
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// If rhelai is enabled, we override with your existing distributed+FSDP approach
+	// -------------------------------------------------------------------------
 	if rhelai {
-		// Train with the most recent dataset
 		latestDataset, err := getLatestDatasetFile()
 		if err != nil {
 			return "", fmt.Errorf("failed to get latest dataset file: %v", err)
 		}
 		cmdArgs = []string{
 			"model", "train",
-			"--pipeline=accelerated",
+			"--pipeline", pipelineType,
 			fmt.Sprintf("--data-path=%s", latestDataset),
-			"--max-batch-len=10000",
+			"--max-batch-len=5000",
 			"--gpus=4",
 			"--device=cuda",
-			"--save-samples=0",
+			"--save-samples=1000",
+			"--num-epochs 1",
 			"--distributed-backend=fsdp",
 			fmt.Sprintf("--model-path=%s", fullModelPath),
 		}
 	}
 
+	log.Printf("[ILAB TRAIN COMMAND] %s %v", ilabPath, cmdArgs)
+
+	// Create the exec.Command
 	cmd := exec.Command(ilabPath, cmdArgs...)
 	if !rhelai {
 		cmd.Dir = baseDir
 	}
 
-	log.Printf("Training command: %s %v", ilabPath, cmdArgs)
 	logFile, err := os.Create(logFilePath)
 	if err != nil {
-		log.Printf("Error creating log file: %v", err)
-		return "", fmt.Errorf("Failed to create log file: %v", err)
+		return "", fmt.Errorf("failed to create log file '%s': %v", logFilePath, err)
 	}
 	defer logFile.Close()
 
@@ -722,10 +784,8 @@ func startTrainJob(modelName, branchName string) (string, error) {
 
 	// Start the command
 	if err := cmd.Start(); err != nil {
-		log.Printf("Error starting training command: %v", err)
-		return "", err
+		return "", fmt.Errorf("error starting training command: %v", err)
 	}
-
 	log.Printf("Training process started with PID: %d", cmd.Process.Pid)
 
 	// Save job details
@@ -739,7 +799,6 @@ func startTrainJob(modelName, branchName string) (string, error) {
 		Branch:    branchName,
 		StartTime: time.Now(),
 	}
-
 	jobsLock.Lock()
 	jobs[jobID] = job
 	jobsLock.Unlock()
@@ -1056,9 +1115,25 @@ func serveLatestCheckpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	latestModelPath := filepath.Join(homeDir, ".local", "share", "instructlab", "checkpoints", "ggml-model-f16.gguf")
-	log.Printf("Serving latest model at %s on port 8001", latestModelPath)
-	serveModel(latestModelPath, "8001", w)
+	if useVllm {
+		// Spawn podman container for latest checkpoint
+		latestModelPath := filepath.Join(homeDir, ".local", "share", "instructlab", "checkpoints", "hf_format")
+		log.Printf("Serving latest model using vllm at %s on port 8001", latestModelPath)
+		runVllmContainer(
+			fmt.Sprintf("%s/%s", latestModelPath, "samples_201"),
+			"8001",
+			"post-train",
+			1, // GPU device index
+			"/var/home/cloud-user",
+			"/var/home/cloud-user",
+			w,
+		)
+	} else {
+		// Default serving behavior
+		latestModelPath := filepath.Join(homeDir, ".local", "share", "instructlab", "checkpoints", "ggml-model-f16.gguf")
+		log.Printf("Serving latest model at %s on port 8001", latestModelPath)
+		serveModel(latestModelPath, "8001", w)
+	}
 }
 
 // serveBaseModel serves the "base" model on port 8000.
@@ -1072,9 +1147,127 @@ func serveBaseModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseModelPath := filepath.Join(homeDir, ".cache", "instructlab", "models", "granite-7b-lab-Q4_K_M.gguf")
-	log.Printf("Serving base model at %s on port 8000", baseModelPath)
-	serveModel(baseModelPath, "8000", w)
+	if useVllm {
+		// Spawn podman container for base model
+		baseModelPath := filepath.Join(homeDir, ".cache", "instructlab", "models", "granite-7b-starter")
+		log.Printf("Serving base model using vllm at %s on port 8000", baseModelPath)
+		runVllmContainer(
+			baseModelPath,
+			"8000",
+			"pre-train",
+			0, // GPU device index
+			"/var/home/cloud-user",
+			"/var/home/cloud-user",
+			w,
+		)
+	} else {
+		// Default serving behavior
+		baseModelPath := filepath.Join(homeDir, ".cache", "instructlab", "models", "granite-7b-lab-Q4_K_M.gguf")
+		log.Printf("Serving base model at %s on port 8000", baseModelPath)
+		serveModel(baseModelPath, "8000", w)
+	}
+}
+
+// runVllmContainer spawns a podman container for vllm-openai with the specified parameters.
+func runVllmContainer(modelPath, port, servedModelName string, gpuIndex int, hostVolume, containerVolume string, w http.ResponseWriter) {
+	// Define the podman run command arguments
+	cmdArgs := []string{
+		"run", "--rm",
+		fmt.Sprintf("--device=nvidia.com/gpu=%d", gpuIndex),
+		fmt.Sprintf("-e=NVIDIA_VISIBLE_DEVICES=%d", gpuIndex),
+		"-v", "/usr/local/cuda-12.4/lib64:/usr/local/cuda-12.4/lib64",
+		"-v", fmt.Sprintf("%s:%s", hostVolume, containerVolume),
+		"-p", fmt.Sprintf("%s:%s", port, port),
+		"--ipc=host",
+		"vllm/vllm-openai:latest",
+		"--host", "0.0.0.0",
+		"--port", port,
+		"--model", modelPath,
+		"--load-format", "safetensors",
+		"--config-format", "hf",
+		"--trust-remote-code",
+		"--device", "cuda",
+		"--served-model-name", servedModelName,
+	}
+
+	// Construct the podman command as a single string for logging
+	fullCmd := fmt.Sprintf("podman %s", strings.Join(cmdArgs, " "))
+	log.Printf("Executing Podman command: %s", fullCmd)
+
+	jobID := fmt.Sprintf("v-%d", time.Now().UnixNano())
+	logFilePath := filepath.Join("logs", fmt.Sprintf("%s.log", jobID))
+	log.Printf("Starting vllm-openai container with job_id: %s, logs: %s", jobID, logFilePath)
+
+	cmd := exec.Command("podman", cmdArgs...)
+
+	// Redirect command output to log file
+	logFile, err := os.Create(logFilePath)
+	if err != nil {
+		log.Printf("Error creating log file for vllm job %s: %v", jobID, err)
+		http.Error(w, "Failed to create log file for vllm job", http.StatusInternalServerError)
+		return
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	// Start the podman container
+	if err := cmd.Start(); err != nil {
+		log.Printf("Error starting podman container for vllm job %s: %v", jobID, err)
+		logFile.Close()
+		http.Error(w, "Failed to start vllm container", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Vllm container started with PID %d for job_id: %s", cmd.Process.Pid, jobID)
+
+	// Save job details
+	job := &Job{
+		JobID:     jobID,
+		Cmd:       "podman",
+		Args:      cmdArgs,
+		Status:    "running",
+		PID:       cmd.Process.Pid,
+		LogFile:   logFilePath,
+		StartTime: time.Now(),
+	}
+
+	jobsLock.Lock()
+	jobs[jobID] = job
+	jobsLock.Unlock()
+	saveJobs()
+
+	// Monitor the podman container
+	go func() {
+		err := cmd.Wait()
+		logFile.Sync()
+		logFile.Close()
+
+		job.Lock.Lock()
+		defer job.Lock.Unlock()
+
+		if err != nil {
+			job.Status = "failed"
+			log.Printf("Vllm job '%s' failed: %v", job.JobID, err)
+		} else if cmd.ProcessState.Success() {
+			job.Status = "finished"
+			log.Printf("Vllm job '%s' finished successfully", job.JobID)
+		} else {
+			job.Status = "failed"
+			log.Printf("Vllm job '%s' failed (unknown reason)", job.JobID)
+		}
+
+		now := time.Now()
+		job.EndTime = &now
+		saveJobs()
+	}()
+
+	// Respond with the job ID
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "vllm container started",
+		"job_id": jobID,
+	})
+	log.Printf("POST /model/serve-%s response sent successfully with job_id: %s", servedModelName, jobID)
 }
 
 // runPipelineJob executes the pipeline steps: Git checkout, data generation, and training.
@@ -1184,4 +1377,78 @@ func runPipelineJob(job *Job, modelName, branchName string) {
 	jobsLock.Unlock()
 	saveJobs()
 	logger.Println("Pipeline job completed successfully.")
+}
+
+func runQnaEval(w http.ResponseWriter, r *http.Request) {
+	log.Println("POST /qna-eval called")
+
+	// Decode the JSON request body
+	var req QnaEvalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Error decoding request body: %v", err)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate that model_path exists
+	if _, err := os.Stat(req.ModelPath); os.IsNotExist(err) {
+		log.Printf("Model path does not exist: %s", req.ModelPath)
+		http.Error(w, fmt.Sprintf("Model path does not exist: %s", req.ModelPath), http.StatusBadRequest)
+		return
+	}
+
+	// Validate that yaml_file exists
+	if _, err := os.Stat(req.YamlFile); os.IsNotExist(err) {
+		log.Printf("YAML file does not exist: %s", req.YamlFile)
+		http.Error(w, fmt.Sprintf("YAML file does not exist: %s", req.YamlFile), http.StatusBadRequest)
+		return
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("Failed to get user's home directory: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Construct the Podman command
+	cmd := exec.Command("podman", "run", "--rm",
+		"--device", "nvidia.com/gpu=all",
+		"-v", fmt.Sprintf("%s:%s", homeDir, homeDir),
+		"quay.io/bsalisbu/qna-eval",
+		"--model_path", req.ModelPath,
+		"--yaml_file", req.YamlFile,
+	)
+
+	// Capture stdout and stderr
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	log.Printf("Executing Podman command: %v", cmd.Args)
+
+	// Run the command
+	err := cmd.Run()
+
+	if err != nil {
+		log.Printf("Podman command failed: %v", err)
+		log.Printf("Error Output: %s", stderr.String())
+
+		// Respond with error logs
+		response := map[string]string{
+			"error": stderr.String(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Command was successful, return the output
+	response := map[string]string{
+		"result": stdout.String(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+	log.Println("POST /qna-eval completed successfully")
 }
