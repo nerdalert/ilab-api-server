@@ -64,8 +64,7 @@ func overwriteCopy(srcPath, destPath string) error {
 
 // getFullModelPath converts a user-supplied model name into a fully qualified path:
 //
-//   ~/.cache/instructlab/models/<modelName>
-//
+//	~/.cache/instructlab/models/<modelName>
 func getFullModelPath(modelName string) (string, error) {
 	baseCacheDir, err := getBaseCacheDir()
 	if err != nil {

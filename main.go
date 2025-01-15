@@ -183,6 +183,7 @@ func runServer(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/model/serve-latest", serveLatestCheckpoint).Methods("POST")
 	r.HandleFunc("/model/serve-base", serveBaseModel).Methods("POST")
 	r.HandleFunc("/qna-eval", runQnaEval).Methods("POST")
+	r.HandleFunc("/checkpoints", listCheckpoints).Methods("GET")
 
 	// Start the server with logging
 	log.Printf("Server starting on port 8080... (Taxonomy path: %s)", taxonomyPath)
@@ -968,6 +969,56 @@ func generateTrainPipeline(w http.ResponseWriter, r *http.Request) {
 	log.Printf("POST /pipeline/generate-train response sent successfully with job_id: %s", pipelineJobID)
 }
 
+// listCheckpoints is the HTTP handler for the /checkpoints endpoint.
+// It lists all directories within the default checkpoints directory.
+func listCheckpoints(w http.ResponseWriter, r *http.Request) {
+	log.Println("GET /checkpoints called")
+
+	// Get the user's home directory
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("Error getting user home directory: %v", err)
+		http.Error(w, "Failed to get user home directory", http.StatusInternalServerError)
+		return
+	}
+
+	// Define the default checkpoints directory
+	checkpointsDir := filepath.Join(homeDir, ".local", "share", "instructlab", "checkpoints", "hf_format")
+
+	// Check if the checkpoints directory exists
+	if _, err := os.Stat(checkpointsDir); os.IsNotExist(err) {
+		log.Printf("Checkpoints directory does not exist: %s", checkpointsDir)
+		http.Error(w, "Checkpoints directory does not exist", http.StatusNotFound)
+		return
+	}
+
+	// Read the contents of the checkpoints directory
+	entries, err := ioutil.ReadDir(checkpointsDir)
+	if err != nil {
+		log.Printf("Error reading checkpoints directory: %v", err)
+		http.Error(w, "Failed to read checkpoints directory", http.StatusInternalServerError)
+		return
+	}
+
+	// Filter out files, retaining only directories
+	var directories []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			directories = append(directories, entry.Name())
+		}
+	}
+
+	// Return the list of directories as JSON
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(directories); err != nil {
+		log.Printf("Error encoding directories to JSON: %v", err)
+		http.Error(w, "Failed to encode directories", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("GET /checkpoints successful, %d directories returned", len(directories))
+}
+
 // serveModel starts serving a model on the specified port.
 func serveModel(modelPath, port string, w http.ResponseWriter) {
 	modelLock.Lock()
@@ -1427,8 +1478,7 @@ func runQnaEval(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Executing Podman command: %v", cmd.Args)
 
-	// Run the command
-	err := cmd.Run()
+	err = cmd.Run()
 
 	if err != nil {
 		log.Printf("Podman command failed: %v", err)

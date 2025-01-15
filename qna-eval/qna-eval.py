@@ -82,7 +82,7 @@ def main():
     # Initialize the language model
     llm = LLM(
         model=args.model_path,
-        dtype="bfloat16",  # Adjust dtype as needed
+        # dtype="bfloat16",  # Adjust dtype as needed
     )
 
     # Define the system prompt
