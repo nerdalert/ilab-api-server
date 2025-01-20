@@ -56,6 +56,14 @@ type QnaEvalRequest struct {
 	YamlFile  string `json:"yaml_file"`
 }
 
+type VllmContainerResponse struct {
+	Containers []VllmContainer `json:"containers"`
+}
+
+type UnloadModelRequest struct {
+	ModelName string `json:"model_name"` // Expected values: "pre-train" or "post-train"
+}
+
 var (
 	baseDir            string
 	taxonomyPath       string
@@ -71,7 +79,7 @@ var (
 	modelProcessBase   *exec.Cmd // Process for base model
 	modelProcessLatest *exec.Cmd // Process for latest model
 	baseModel          = "instructlab/granite-7b-lab"
-
+	servedModelJobIDs  = make(map[string]string) // Maps "pre-train"/"post-train" => jobID
 	// Cache variables
 	modelCache = ModelCache{}
 )
@@ -85,16 +93,13 @@ func main() {
 		Run:   runServer,
 	}
 
-	// Define flags
 	rootCmd.Flags().BoolVar(&rhelai, "rhelai", false, "Use ilab binary from PATH instead of Python virtual environment")
 	rootCmd.Flags().StringVar(&baseDir, "base-dir", "", "Base directory for ilab operations (required if --rhelai is not set)")
 	rootCmd.Flags().StringVar(&taxonomyPath, "taxonomy-path", "", "Path to the taxonomy repository for Git operations (required)")
 	rootCmd.Flags().BoolVar(&isOSX, "osx", false, "Enable OSX-specific settings (default: false)")
 	rootCmd.Flags().BoolVar(&isCuda, "cuda", false, "Enable Cuda (default: false)")
 	rootCmd.Flags().BoolVar(&useVllm, "vllm", false, "Enable VLLM model serving using podman containers")
-
-	// New pipeline flag:
-	rootCmd.Flags().StringVar(&pipelineType, "pipeline", "simple", "Pipeline type (simple or full)")
+	rootCmd.Flags().StringVar(&pipelineType, "pipeline", "", "Pipeline type (simple, accelerated, full)")
 
 	// Mark flags as required based on --rhelai
 	rootCmd.PreRunE = func(cmd *cobra.Command, args []string) error {
@@ -105,12 +110,31 @@ func main() {
 			return fmt.Errorf("--taxonomy-path is required")
 		}
 
-		// Validate pipelineType
-		switch pipelineType {
-		case "simple", "full":
-			// ok
-		default:
-			return fmt.Errorf("--pipeline must be 'simple' or 'full'; got '%s'", pipelineType)
+		// Validate or set pipelineType based on --rhelai
+		if !rhelai {
+			if pipelineType == "" {
+				return fmt.Errorf("--pipeline is required unless --rhelai is set")
+			}
+			switch pipelineType {
+			case "simple", "full", "accelerated":
+				// Valid pipeline types
+			default:
+				return fmt.Errorf("--pipeline must be 'simple', 'accelerated' or 'full'; got '%s'", pipelineType)
+			}
+		} else {
+			// When --rhelai is set and --pipeline is not provided, set a default pipelineType
+			if pipelineType == "" {
+				pipelineType = "accelerated" // Default pipeline when --rhelai is enabled
+				log.Println("--rhelai is set; defaulting --pipeline to 'accelerated'")
+			} else {
+				// If pipelineType is provided, validate it
+				switch pipelineType {
+				case "simple", "full", "accelerated":
+					// Valid pipeline types
+				default:
+					return fmt.Errorf("--pipeline must be 'simple', 'accelerated' or 'full'; got '%s'", pipelineType)
+				}
+			}
 		}
 
 		return nil
@@ -184,6 +208,10 @@ func runServer(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/model/serve-base", serveBaseModel).Methods("POST")
 	r.HandleFunc("/qna-eval", runQnaEval).Methods("POST")
 	r.HandleFunc("/checkpoints", listCheckpoints).Methods("GET")
+	r.HandleFunc("/vllm-containers", listVllmContainersHandler).Methods("GET")
+	r.HandleFunc("/vllm-unload", unloadVllmContainerHandler).Methods("POST")
+	r.HandleFunc("/vllm-status", getVllmStatusHandler).Methods("GET")
+	r.HandleFunc("/gpu-free", getGpuFreeHandler).Methods("GET")
 
 	// Start the server with logging
 	log.Printf("Server starting on port 8080... (Taxonomy path: %s)", taxonomyPath)
@@ -339,6 +367,8 @@ func initializeModelCache() {
 }
 
 // Refresh the model cache if it's older than 20 minutes
+// TODO: needs to be more realtime, ilab command delays on RHEL make it problematic so it needs to be cached
+// until the delay is resolved in rhelai podman caching
 func refreshModelCache() {
 	modelCache.Mutex.Lock()
 	defer modelCache.Mutex.Unlock()
@@ -517,7 +547,7 @@ func startGenerateJob() (string, error) {
 	ilabPath := getIlabCommand()
 
 	//cmdArgs := []string{"data", "generate", "--pipeline", pipelineType}
-	// TODO: bother supporting any other pipeline for generate?
+	// TODO: for now, focus on accelerated pipeline.
 	// Should GPUs be variable or just the default?
 	cmdArgs := []string{"data", "generate"}
 
@@ -597,6 +627,7 @@ func trainModel(w http.ResponseWriter, r *http.Request) {
 	var reqBody struct {
 		ModelName  string `json:"modelName"`
 		BranchName string `json:"branchName"`
+		Epochs     *int   `json:"epochs,omitempty"` // Optional
 	}
 
 	// Parse the request body
@@ -606,12 +637,20 @@ func trainModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Received train request with modelName: '%s', branchName: '%s'", reqBody.ModelName, reqBody.BranchName)
+	log.Printf("Received train request with modelName: '%s', branchName: '%s', epochs: '%v'",
+		reqBody.ModelName, reqBody.BranchName, reqBody.Epochs)
 
 	// Ensure required fields are provided
 	if reqBody.ModelName == "" || reqBody.BranchName == "" {
 		log.Println("Missing required parameters: modelName or branchName")
 		http.Error(w, "Missing required parameters: modelName or branchName", http.StatusBadRequest)
+		return
+	}
+
+	// If epochs is provided, ensure it's a positive integer
+	if reqBody.Epochs != nil && *reqBody.Epochs <= 0 {
+		log.Println("Invalid 'epochs' parameter: must be a positive integer")
+		http.Error(w, "'epochs' must be a positive integer", http.StatusBadRequest)
 		return
 	}
 
@@ -634,8 +673,8 @@ func trainModel(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Successfully checked out branch: '%s'", reqBody.BranchName)
 
-	// Start the training job, passing the sanitized model name and branch name
-	jobID, err := startTrainJob(sanitizedModelName, reqBody.BranchName)
+	// Start the training job, passing the sanitized model name, branch name, and epochs
+	jobID, err := startTrainJob(sanitizedModelName, reqBody.BranchName, reqBody.Epochs)
 	if err != nil {
 		log.Printf("Error starting train job: %v", err)
 		http.Error(w, "Failed to start train job", http.StatusInternalServerError)
@@ -658,7 +697,203 @@ func trainModel(w http.ResponseWriter, r *http.Request) {
 	log.Println("POST /model/train response sent successfully")
 }
 
-func startTrainJob(modelName, branchName string) (string, error) {
+// listVllmContainersHandler handles the GET /vllm-containers endpoint.
+func listVllmContainersHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println("GET /vllm-containers called")
+
+	containers, err := ListVllmContainers()
+	if err != nil {
+		log.Printf("Error listing vllm containers: %v", err)
+		http.Error(w, "Failed to list vllm containers", http.StatusInternalServerError)
+		return
+	}
+
+	response := VllmContainerResponse{
+		Containers: containers,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding vllm containers response: %v", err)
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("GET /vllm-containers returned %d containers", len(containers))
+}
+
+// unloadVllmContainerHandler handles the POST /vllm-unload endpoint.
+func unloadVllmContainerHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println("POST /vllm-unload called")
+
+	var req UnloadModelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Error decoding unload model request: %v", err)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate the model name
+	modelName := strings.TrimSpace(req.ModelName)
+	if modelName != "pre-train" && modelName != "post-train" {
+		log.Printf("Invalid model_name provided: %s", modelName)
+		http.Error(w, "Invalid model_name. Must be 'pre-train' or 'post-train'", http.StatusBadRequest)
+		return
+	}
+
+	// Attempt to stop the vllm container
+	err := StopVllmContainer(modelName)
+	if err != nil {
+		log.Printf("Error unloading model '%s': %v", modelName, err)
+		http.Error(w, fmt.Sprintf("Failed to unload model '%s': %v", modelName, err), http.StatusInternalServerError)
+		return
+	}
+
+	// Respond with success
+	response := map[string]string{
+		"status":    "success",
+		"message":   fmt.Sprintf("Model '%s' unloaded successfully", modelName),
+		"modelName": modelName,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+
+	log.Printf("POST /vllm-unload successfully unloaded model '%s'", modelName)
+}
+
+func getVllmStatusHandler(w http.ResponseWriter, r *http.Request) {
+	// e.g. GET /vllm-status?model_name=pre-train
+	modelName := r.URL.Query().Get("model_name")
+	if modelName != "pre-train" && modelName != "post-train" {
+		http.Error(w, "Invalid model_name (must be 'pre-train' or 'post-train')", http.StatusBadRequest)
+		return
+	}
+
+	// 1) Check if container with that served-model-name is running
+	containers, err := ListVllmContainers()
+	if err != nil {
+		log.Printf("Error listing vllm containers: %v", err)
+		http.Error(w, "Failed to list vllm containers", http.StatusInternalServerError)
+		return
+	}
+
+	var containerRunning bool
+	for _, c := range containers {
+		if c.ServedModelName == modelName {
+			containerRunning = true
+			break
+		}
+	}
+
+	// If the container is not running => status = "stopped" (or respond however you want)
+	if !containerRunning {
+		// Optionally return JSON with { "status": "stopped" }
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
+		return
+	}
+
+	// Container is indeed running. Let's find the job logs for that container:
+	jobsLock.Lock()
+	jobID, ok := servedModelJobIDs[modelName]
+	jobsLock.Unlock()
+	if !ok {
+		// If for some reason we don't have a job ID stored, we can do "loading" or "unknown"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "loading"})
+		return
+	}
+
+	// Retrieve the job to find the log file
+	jobsLock.Lock()
+	job, exists := jobs[jobID]
+	jobsLock.Unlock()
+	if !exists {
+		// If the job no longer exists, handle it as you wish
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "loading"})
+		return
+	}
+
+	// Attempt to see if the log contains "Uvicorn running on"
+	if job.LogFile == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "loading"})
+		return
+	}
+
+	logBytes, err := ioutil.ReadFile(job.LogFile)
+	if err != nil {
+		// If there's an error reading logs, treat it as "loading"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "loading"})
+		return
+	}
+
+	logContent := string(logBytes)
+	if strings.Contains(logContent, "Uvicorn running on") {
+		// if found => "running"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "running"})
+	} else {
+		// not found => "loading"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "loading"})
+	}
+}
+
+// getQpuFreeHandler checks how many GPUs are "free" based on nvidia-smi output.
+func getGpuFreeHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println("GET /gpu-free called")
+
+	cmd := exec.Command("nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader")
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("Error running nvidia-smi: %v, stderr: %s", err, stderr.String())
+		w.Header().Set("Content-Type", "application/json")
+		// Return zero for both free_gpus & total_gpus on error
+		json.NewEncoder(w).Encode(map[string]int{"free_gpus": 0, "total_gpus": 0})
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	freeCount := 0
+
+	// Track total GPUs
+	totalCount := 0
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Increment total GPUs for each non-empty line
+		totalCount++
+
+		// If it's "1 MiB" we consider that GPU free
+		if strings.HasPrefix(line, "1 ") {
+			freeCount++
+		}
+	}
+
+	// Return both free_gpus and total_gpus
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int{
+		"free_gpus":  freeCount,
+		"total_gpus": totalCount,
+	})
+
+	log.Printf("GET /gpu-free => free_gpus=%d, total_gpus=%d", freeCount, totalCount)
+}
+
+// startTrainJob starts a training job with the given parameters.
+func startTrainJob(modelName, branchName string, epochs *int) (string, error) {
 	log.Printf("Starting training job for model: '%s', branch: '%s'", modelName, branchName)
 
 	// Generate a unique job ID
@@ -672,7 +907,7 @@ func startTrainJob(modelName, branchName string) (string, error) {
 	}
 	log.Printf("Resolved fullModelPath: '%s'", fullModelPath)
 
-	// Ensure the model directory exists (e.g. ~/.cache/instructlab/models/...)
+	// Ensure the model directory exists (e.g., ~/.cache/instructlab/models/...)
 	modelDir := filepath.Dir(fullModelPath)
 	if err := os.MkdirAll(modelDir, os.ModePerm); err != nil {
 		return "", fmt.Errorf("failed to create model directory '%s': %v", modelDir, err)
@@ -680,17 +915,33 @@ func startTrainJob(modelName, branchName string) (string, error) {
 
 	ilabPath := getIlabCommand()
 
-	// Default base training command (if pipeline != "simple" or we skip that logic):
+	// Initialize command arguments
 	cmdArgs := []string{
 		"model", "train",
-		"--pipeline", pipelineType,
-		fmt.Sprintf("--model-path=%s", fullModelPath), // <--- Note the absolute path here
 	}
+
+	// Conditionally add the --pipeline argument only if not rhelai and pipelineType is set
+	if !rhelai && pipelineType != "" {
+		cmdArgs = append(cmdArgs, "--pipeline", pipelineType)
+	}
+
+	// Always include --model-path
+	cmdArgs = append(cmdArgs, fmt.Sprintf("--model-path=%s", fullModelPath))
+
+	// Append device flags based on configuration
 	if isOSX {
 		cmdArgs = append(cmdArgs, "--device=mps")
 	}
 	if isCuda {
 		cmdArgs = append(cmdArgs, "--device=cuda")
+	}
+
+	// Conditionally add the --num-epochs flag if epochs is specified
+	if epochs != nil {
+		cmdArgs = append(cmdArgs, fmt.Sprintf("--num-epochs=%d", *epochs))
+		log.Printf("Number of epochs specified: %d", *epochs)
+	} else {
+		log.Println("No epochs specified; using default number of epochs.")
 	}
 
 	// -------------------------------------------------------------------------
@@ -733,7 +984,7 @@ func startTrainJob(modelName, branchName string) (string, error) {
 			"model", "train",
 			"--pipeline", pipelineType,
 			fmt.Sprintf("--data-path=%s", datasetDir),
-			fmt.Sprintf("--model-path=%s", fullModelPath), // <--- Use absolute path here too
+			fmt.Sprintf("--model-path=%s", fullModelPath),
 		}
 		if isOSX {
 			cmdArgs = append(cmdArgs, "--device=mps")
@@ -741,11 +992,17 @@ func startTrainJob(modelName, branchName string) (string, error) {
 		if isCuda {
 			cmdArgs = append(cmdArgs, "--device=cuda")
 		}
+
+		// Re-apply the epoch flag if epochs were specified
+		if epochs != nil {
+			cmdArgs = append(cmdArgs, fmt.Sprintf("--num-epochs=%d", *epochs))
+			log.Printf("Number of epochs specified for simple pipeline: %d", *epochs)
+		} else {
+			log.Println("No epochs specified for simple pipeline; using default number of epochs.")
+		}
 	}
 
-	// -------------------------------------------------------------------------
-	// If rhelai is enabled, we override with your existing distributed+FSDP approach
-	// -------------------------------------------------------------------------
+	// Handle rhelai-specific logic
 	if rhelai {
 		latestDataset, err := getLatestDatasetFile()
 		if err != nil {
@@ -753,15 +1010,19 @@ func startTrainJob(modelName, branchName string) (string, error) {
 		}
 		cmdArgs = []string{
 			"model", "train",
-			"--pipeline", pipelineType,
 			fmt.Sprintf("--data-path=%s", latestDataset),
 			"--max-batch-len=5000",
 			"--gpus=4",
 			"--device=cuda",
 			"--save-samples=1000",
-			"--num-epochs 1",
-			"--distributed-backend=fsdp",
 			fmt.Sprintf("--model-path=%s", fullModelPath),
+			"--pipeline", pipelineType, // Include the pipelineType set in PreRunE
+		}
+		if epochs != nil {
+			cmdArgs = append(cmdArgs, fmt.Sprintf("--num-epochs=%d", *epochs))
+			log.Printf("Number of epochs specified for rhelai pipeline: %d", *epochs)
+		} else {
+			log.Println("No epochs specified for rhelai pipeline; using default number of epochs.")
 		}
 	}
 
@@ -800,6 +1061,7 @@ func startTrainJob(modelName, branchName string) (string, error) {
 		Branch:    branchName,
 		StartTime: time.Now(),
 	}
+
 	jobsLock.Lock()
 	jobs[jobID] = job
 	jobsLock.Unlock()
@@ -808,6 +1070,8 @@ func startTrainJob(modelName, branchName string) (string, error) {
 	// Wait for process completion in a goroutine
 	go func() {
 		err := cmd.Wait()
+		logFile.Close()
+
 		job.Lock.Lock()
 		defer job.Lock.Unlock()
 
@@ -912,6 +1176,7 @@ func generateTrainPipeline(w http.ResponseWriter, r *http.Request) {
 	var reqBody struct {
 		ModelName  string `json:"modelName"`
 		BranchName string `json:"branchName"`
+		Epochs     *int   `json:"epochs,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 		log.Printf("Error parsing request body: %v", err)
@@ -953,7 +1218,7 @@ func generateTrainPipeline(w http.ResponseWriter, r *http.Request) {
 	saveJobs()
 
 	// Start the pipeline in a separate goroutine
-	go runPipelineJob(job, sanitizedModelName, reqBody.BranchName)
+	go runPipelineJob(job, sanitizedModelName, reqBody.BranchName, reqBody.Epochs)
 
 	// Respond immediately with the pipeline job ID
 	response := map[string]string{
@@ -1171,7 +1436,7 @@ func serveLatestCheckpoint(w http.ResponseWriter, r *http.Request) {
 		latestModelPath := filepath.Join(homeDir, ".local", "share", "instructlab", "checkpoints", "hf_format")
 		log.Printf("Serving latest model using vllm at %s on port 8001", latestModelPath)
 		runVllmContainer(
-			fmt.Sprintf("%s/%s", latestModelPath, "samples_201"),
+			fmt.Sprintf("%s/%s", latestModelPath, "samples_1192378"),
 			"8001",
 			"post-train",
 			1, // GPU device index
@@ -1200,7 +1465,7 @@ func serveBaseModel(w http.ResponseWriter, r *http.Request) {
 
 	if useVllm {
 		// Spawn podman container for base model
-		baseModelPath := filepath.Join(homeDir, ".cache", "instructlab", "models", "granite-7b-starter")
+		baseModelPath := filepath.Join(homeDir, ".cache", "instructlab", "models", "granite-8b-starter-v1")
 		log.Printf("Serving base model using vllm at %s on port 8000", baseModelPath)
 		runVllmContainer(
 			baseModelPath,
@@ -1219,9 +1484,8 @@ func serveBaseModel(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// runVllmContainer spawns a podman container for vllm-openai with the specified parameters.
+// runVllmContainer spawns a podman container running vllm
 func runVllmContainer(modelPath, port, servedModelName string, gpuIndex int, hostVolume, containerVolume string, w http.ResponseWriter) {
-	// Define the podman run command arguments
 	cmdArgs := []string{
 		"run", "--rm",
 		fmt.Sprintf("--device=nvidia.com/gpu=%d", gpuIndex),
@@ -1241,7 +1505,6 @@ func runVllmContainer(modelPath, port, servedModelName string, gpuIndex int, hos
 		"--served-model-name", servedModelName,
 	}
 
-	// Construct the podman command as a single string for logging
 	fullCmd := fmt.Sprintf("podman %s", strings.Join(cmdArgs, " "))
 	log.Printf("Executing Podman command: %s", fullCmd)
 
@@ -1261,7 +1524,6 @@ func runVllmContainer(modelPath, port, servedModelName string, gpuIndex int, hos
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
-	// Start the podman container
 	if err := cmd.Start(); err != nil {
 		log.Printf("Error starting podman container for vllm job %s: %v", jobID, err)
 		logFile.Close()
@@ -1287,7 +1549,8 @@ func runVllmContainer(modelPath, port, servedModelName string, gpuIndex int, hos
 	jobsLock.Unlock()
 	saveJobs()
 
-	// Monitor the podman container
+	servedModelJobIDs[servedModelName] = jobID
+
 	go func() {
 		err := cmd.Wait()
 		logFile.Sync()
@@ -1322,7 +1585,7 @@ func runVllmContainer(modelPath, port, servedModelName string, gpuIndex int, hos
 }
 
 // runPipelineJob executes the pipeline steps: Git checkout, data generation, and training.
-func runPipelineJob(job *Job, modelName, branchName string) {
+func runPipelineJob(job *Job, modelName, branchName string, epochs *int) {
 	logFile, err := os.Create(job.LogFile)
 	if err != nil {
 		log.Printf("Error creating pipeline log file for job %s: %v", job.JobID, err)
@@ -1336,7 +1599,7 @@ func runPipelineJob(job *Job, modelName, branchName string) {
 
 	logger := log.New(logFile, "", log.LstdFlags)
 
-	logger.Printf("Starting pipeline job: %s, model: %s, branch: %s", job.JobID, modelName, branchName)
+	logger.Printf("Starting pipeline job: %s, model: %s, branch: %s, epochs: %v", job.JobID, modelName, branchName, epochs)
 
 	// Perform Git checkout
 	gitCheckoutCmd := exec.Command("git", "checkout", branchName)
@@ -1389,7 +1652,7 @@ func runPipelineJob(job *Job, modelName, branchName string) {
 
 	// Start training step
 	logger.Println("Starting training step...")
-	trainJobID, trainErr := startTrainJob(modelName, branchName)
+	trainJobID, trainErr := startTrainJob(modelName, branchName, epochs)
 	if trainErr != nil {
 		logger.Printf("Training step failed: %v", trainErr)
 		jobsLock.Lock()
